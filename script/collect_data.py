@@ -13,6 +13,8 @@ import json
 import traceback
 import os
 import time
+import math
+import shutil
 from argparse import ArgumentParser
 
 current_file_path = os.path.abspath(__file__)
@@ -105,6 +107,51 @@ def main(task_name=None, task_config=None):
 
 def run(TASK_ENV, args):
     epid, suc_num, fail_num, seed_list = 0, 0, 0, []
+    selected_seed_records = []
+
+    data_filter_cfg = args.get("data_filter", {}) or {}
+    enable_data_filter = data_filter_cfg.get("enable", True)
+    oversample_ratio = max(1.0, float(data_filter_cfg.get("oversample_ratio", 1.3)))
+    min_extra = max(0, int(data_filter_cfg.get("min_extra", 10)))
+    episode_num = int(args["episode_num"])
+    collect_target = episode_num if not enable_data_filter else max(
+        episode_num + min_extra, math.ceil(episode_num * oversample_ratio)
+    )
+
+    score_weight_cfg = data_filter_cfg.get("score_weights", {}) or {}
+    w_waypoint = float(score_weight_cfg.get("waypoint_count", 1.0))
+    w_motion = float(score_weight_cfg.get("joint_motion", 0.05))
+    w_balance = float(score_weight_cfg.get("left_right_balance", 0.2))
+
+    def _path_complexity(path):
+        waypoint_num = len(path)
+        motion = 0.0
+        if waypoint_num > 1:
+            for i in range(1, waypoint_num):
+                prev_state = path[i - 1]
+                curr_state = path[i]
+                if len(prev_state) != len(curr_state):
+                    continue
+                for j in range(len(curr_state)):
+                    motion += abs(float(curr_state[j]) - float(prev_state[j]))
+        return waypoint_num, motion
+
+    def _trajectory_quality_score(left_path, right_path):
+        left_waypoint, left_motion = _path_complexity(left_path)
+        right_waypoint, right_motion = _path_complexity(right_path)
+        waypoint_cost = left_waypoint + right_waypoint
+        motion_cost = left_motion + right_motion
+        balance_cost = abs(left_waypoint - right_waypoint)
+        score = w_waypoint * waypoint_cost + w_motion * motion_cost + w_balance * balance_cost
+        return float(score), {
+            "left_waypoint": left_waypoint,
+            "right_waypoint": right_waypoint,
+            "left_motion": float(left_motion),
+            "right_motion": float(right_motion),
+            "waypoint_cost": float(waypoint_cost),
+            "motion_cost": float(motion_cost),
+            "balance_cost": float(balance_cost),
+        }
 
     print(f"Task Name: \033[34m{args['task_name']}\033[0m")
 
@@ -114,9 +161,14 @@ def run(TASK_ENV, args):
     if not args["use_seed"]:
         print("\033[93m" + "[Start Seed and Pre Motion Data Collection]" + "\033[0m")
         args["need_plan"] = True
+        print(f"Data filter: enable={enable_data_filter}, collect_target={collect_target}, keep={episode_num}")
 
-        if os.path.exists(os.path.join(args["save_path"], "seed.txt")):
-            with open(os.path.join(args["save_path"], "seed.txt"), "r") as file:
+        all_seed_file_path = os.path.join(args["save_path"], "seed_all.txt")
+        if not os.path.exists(all_seed_file_path):
+            all_seed_file_path = os.path.join(args["save_path"], "seed.txt")
+
+        if os.path.exists(all_seed_file_path):
+            with open(all_seed_file_path, "r") as file:
                 seed_list = file.read().split()
                 if len(seed_list) != 0:
                     seed_list = [int(i) for i in seed_list]
@@ -124,15 +176,31 @@ def run(TASK_ENV, args):
                     epid = max(seed_list) + 1
             print(f"Exist seed file, Start from: {epid} / {suc_num}")
 
-        while suc_num < args["episode_num"]:
+        score_file_path = os.path.join(args["save_path"], "seed_scores.json")
+        if os.path.exists(score_file_path):
+            with open(score_file_path, "r", encoding="utf-8") as file:
+                selected_seed_records = json.load(file)
+        else:
+            selected_seed_records = []
+
+        while suc_num < collect_target:
             try:
                 TASK_ENV.setup_demo(now_ep_num=suc_num, seed=epid, **args)
                 TASK_ENV.play_once()
 
                 if TASK_ENV.plan_success and TASK_ENV.check_success():
+                    score, score_detail = _trajectory_quality_score(TASK_ENV.left_joint_path, TASK_ENV.right_joint_path)
                     print(f"simulate data episode {suc_num} success! (seed = {epid})")
                     seed_list.append(epid)
                     TASK_ENV.save_traj_data(suc_num)
+                    selected_seed_records.append(
+                        {
+                            "candidate_idx": suc_num,
+                            "seed": int(epid),
+                            "quality_score": score,
+                            "detail": score_detail,
+                        }
+                    )
                     suc_num += 1
                 else:
                     print(f"simulate data episode {suc_num} fail! (seed = {epid})")
@@ -168,11 +236,53 @@ def run(TASK_ENV, args):
 
             epid += 1
 
-            with open(os.path.join(args["save_path"], "seed.txt"), "w") as file:
+            with open(os.path.join(args["save_path"], "seed_all.txt"), "w") as file:
                 for sed in seed_list:
                     file.write("%s " % sed)
+            with open(score_file_path, "w", encoding="utf-8") as file:
+                json.dump(selected_seed_records, file, ensure_ascii=False, indent=4)
 
-        print(f"\nComplete simulation, failed \033[91m{fail_num}\033[0m times / {epid} tries \n")
+        if len(selected_seed_records) == 0:
+            raise RuntimeError("No valid seed collected. Please check task configuration.")
+
+        if not enable_data_filter:
+            best_records = selected_seed_records[:episode_num]
+        else:
+            best_records = sorted(selected_seed_records, key=lambda x: x["quality_score"])[:episode_num]
+
+        seed_list = [record["seed"] for record in best_records]
+        with open(os.path.join(args["save_path"], "seed.txt"), "w") as file:
+            for sed in seed_list:
+                file.write("%s " % sed)
+
+        # re-index selected trajectory data to episode0..episode{episode_num-1}
+        traj_data_path = os.path.join(args["save_path"], "_traj_data")
+        for target_idx, record in enumerate(best_records):
+            source_idx = int(record["candidate_idx"])
+            src_file = os.path.join(traj_data_path, f"episode{source_idx}.pkl")
+            dst_file = os.path.join(traj_data_path, f"episode{target_idx}.pkl")
+            if os.path.exists(src_file):
+                if src_file != dst_file:
+                    shutil.copy2(src_file, dst_file)
+
+        selection_report = {
+            "filter_enable": enable_data_filter,
+            "collect_target": collect_target,
+            "keep_target": episode_num,
+            "score_weight": {
+                "waypoint_count": w_waypoint,
+                "joint_motion": w_motion,
+                "left_right_balance": w_balance,
+            },
+            "selected": best_records,
+        }
+        with open(os.path.join(args["save_path"], "seed_selection_report.json"), "w", encoding="utf-8") as file:
+            json.dump(selection_report, file, ensure_ascii=False, indent=4)
+
+        print(
+            f"\nComplete simulation, failed \033[91m{fail_num}\033[0m times / {epid} tries, "
+            f"collected {collect_target} and kept {len(seed_list)} episodes.\n"
+        )
     else:
         print("\033[93m" + "Use Saved Seeds List".center(30, "-") + "\033[0m")
         with open(os.path.join(args["save_path"], "seed.txt"), "r") as file:
