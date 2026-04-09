@@ -13,6 +13,7 @@ import json
 import traceback
 import os
 import time
+import shutil
 from argparse import ArgumentParser
 
 current_file_path = os.path.abspath(__file__)
@@ -105,6 +106,57 @@ def main(task_name=None, task_config=None):
 
 def run(TASK_ENV, args):
     epid, suc_num, fail_num, seed_list = 0, 0, 0, []
+    selected_seed_quality = []
+
+    target_episode_num = args["episode_num"]
+    candidate_episode_num = args.get(
+        "candidate_episode_num",
+        target_episode_num + max(1, int(target_episode_num * 0.2)),
+    )
+    candidate_episode_num = max(candidate_episode_num, target_episode_num + 1)
+
+    def calc_traj_quality(task_env):
+        left_path = getattr(task_env, "left_joint_path", []) or []
+        right_path = getattr(task_env, "right_joint_path", []) or []
+        total_step_num = len(left_path) + len(right_path)
+        # Larger score means better quality. Prefer shorter successful trajectories.
+        return -total_step_num
+
+    def rewrite_filtered_traj_and_seed(candidate_records):
+        selected_records = sorted(candidate_records, key=lambda x: x["quality"], reverse=True)[:target_episode_num]
+        selected_records = sorted(selected_records, key=lambda x: x["quality"], reverse=True)
+
+        traj_dir = os.path.join(args["save_path"], "_traj_data")
+        tmp_traj_dir = os.path.join(args["save_path"], "_traj_data_filtered_tmp")
+        os.makedirs(tmp_traj_dir, exist_ok=True)
+
+        for new_idx, record in enumerate(selected_records):
+            src_file = os.path.join(traj_dir, f"episode{record['idx']}.pkl")
+            dst_file = os.path.join(tmp_traj_dir, f"episode{new_idx}.pkl")
+            shutil.copy2(src_file, dst_file)
+
+        if os.path.exists(traj_dir):
+            shutil.rmtree(traj_dir)
+        shutil.move(tmp_traj_dir, traj_dir)
+
+        filtered_seeds = [record["seed"] for record in selected_records]
+        with open(os.path.join(args["save_path"], "seed.txt"), "w") as file:
+            for sed in filtered_seeds:
+                file.write("%s " % sed)
+
+        with open(os.path.join(args["save_path"], "seed_quality.json"), "w", encoding="utf-8") as file:
+            json.dump(
+                {
+                    "target_episode_num": target_episode_num,
+                    "candidate_episode_num": candidate_episode_num,
+                    "selected": selected_records,
+                    "all_candidates": sorted(candidate_records, key=lambda x: x["quality"], reverse=True),
+                },
+                file,
+                ensure_ascii=False,
+                indent=4,
+            )
+        return filtered_seeds, selected_records
 
     print(f"Task Name: \033[34m{args['task_name']}\033[0m")
 
@@ -124,7 +176,7 @@ def run(TASK_ENV, args):
                     epid = max(seed_list) + 1
             print(f"Exist seed file, Start from: {epid} / {suc_num}")
 
-        while suc_num < args["episode_num"]:
+        while suc_num < candidate_episode_num:
             try:
                 TASK_ENV.setup_demo(now_ep_num=suc_num, seed=epid, **args)
                 TASK_ENV.play_once()
@@ -132,6 +184,8 @@ def run(TASK_ENV, args):
                 if TASK_ENV.plan_success and TASK_ENV.check_success():
                     print(f"simulate data episode {suc_num} success! (seed = {epid})")
                     seed_list.append(epid)
+                    quality_score = calc_traj_quality(TASK_ENV)
+                    selected_seed_quality.append({"idx": suc_num, "seed": epid, "quality": quality_score})
                     TASK_ENV.save_traj_data(suc_num)
                     suc_num += 1
                 else:
@@ -172,12 +226,16 @@ def run(TASK_ENV, args):
                 for sed in seed_list:
                     file.write("%s " % sed)
 
+        seed_list, selected_seed_quality = rewrite_filtered_traj_and_seed(selected_seed_quality)
+
         print(f"\nComplete simulation, failed \033[91m{fail_num}\033[0m times / {epid} tries \n")
     else:
         print("\033[93m" + "Use Saved Seeds List".center(30, "-") + "\033[0m")
         with open(os.path.join(args["save_path"], "seed.txt"), "r") as file:
             seed_list = file.read().split()
             seed_list = [int(i) for i in seed_list]
+        if len(seed_list) > target_episode_num:
+            seed_list = seed_list[:target_episode_num]
 
     # =========== Collect Data ===========
 
@@ -199,7 +257,7 @@ def run(TASK_ENV, args):
         while exist_hdf5(st_idx):
             st_idx += 1
 
-        for episode_idx in range(st_idx, args["episode_num"]):
+        for episode_idx in range(st_idx, target_episode_num):
             print(f"\033[34mTask name: {args['task_name']}\033[0m")
 
             TASK_ENV.setup_demo(now_ep_num=episode_idx, seed=seed_list[episode_idx], **args)
