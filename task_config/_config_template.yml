@@ -1,5 +1,6 @@
 render_freq: 0
 episode_num: 50
+quality_filter_extra_episode_num: 10
 use_seed: false
 save_freq: 15
 embodiment:
