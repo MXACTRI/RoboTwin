@@ -13,6 +13,9 @@ import json
 import traceback
 import os
 import time
+import math
+import pickle
+import numpy as np
 from argparse import ArgumentParser
 
 current_file_path = os.path.abspath(__file__)
@@ -34,6 +37,132 @@ def get_embodiment_config(robot_file):
     with open(robot_config_file, "r", encoding="utf-8") as f:
         embodiment_args = yaml.load(f.read(), Loader=yaml.FullLoader)
     return embodiment_args
+
+
+def _flatten_joint_positions(path_list):
+    position_seq = []
+    for result in path_list:
+        if not isinstance(result, dict):
+            continue
+        if result.get("status") != "Success":
+            continue
+        pos = result.get("position")
+        if pos is None:
+            continue
+        pos = np.asarray(pos, dtype=np.float64)
+        if pos.ndim == 1:
+            pos = pos[None, :]
+        if pos.shape[0] == 0:
+            continue
+        position_seq.append(pos)
+    if len(position_seq) == 0:
+        return np.zeros((0, 0), dtype=np.float64)
+    return np.concatenate(position_seq, axis=0)
+
+
+def _calc_path_length(positions):
+    if positions.shape[0] < 2:
+        return 0.0
+    return float(np.linalg.norm(np.diff(positions, axis=0), axis=1).sum())
+
+
+def _calc_smoothness(positions):
+    if positions.shape[0] < 3:
+        return 0.0
+    accel = np.diff(positions, n=2, axis=0)
+    return float(np.linalg.norm(accel, axis=1).mean())
+
+
+def _calc_ee_path_length(path_list):
+    """
+    优先使用轨迹中可能存在的末端执行器位姿字段；若不存在则返回 None。
+    """
+    candidate_keys = ["ee_pose", "ee_poses", "end_effector_pose", "eef_pose", "target_pose"]
+    points = []
+    for result in path_list:
+        if not isinstance(result, dict):
+            continue
+        for key in candidate_keys:
+            if key not in result:
+                continue
+            raw = np.asarray(result[key], dtype=np.float64)
+            if raw.ndim == 1 and raw.shape[0] >= 3:
+                points.append(raw[:3])
+            elif raw.ndim == 2 and raw.shape[1] >= 3:
+                points.extend(raw[:, :3])
+            break
+    if len(points) < 2:
+        return None
+    points = np.asarray(points, dtype=np.float64)
+    return float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+
+
+def _compute_episode_metrics(traj_data):
+    left_pos = _flatten_joint_positions(traj_data.get("left_joint_path", []))
+    right_pos = _flatten_joint_positions(traj_data.get("right_joint_path", []))
+
+    joint_path_length = _calc_path_length(left_pos) + _calc_path_length(right_pos)
+    smoothness = _calc_smoothness(left_pos) + _calc_smoothness(right_pos)
+
+    left_ee_len = _calc_ee_path_length(traj_data.get("left_joint_path", []))
+    right_ee_len = _calc_ee_path_length(traj_data.get("right_joint_path", []))
+    if left_ee_len is None and right_ee_len is None:
+        # 当前默认 planner 结果中通常仅含 joint trajectory，使用 joint path length 作为代理指标
+        ee_path_length = joint_path_length
+        ee_path_source = "joint_path_proxy"
+    else:
+        ee_path_length = (0.0 if left_ee_len is None else left_ee_len) + (0.0 if right_ee_len is None else right_ee_len)
+        ee_path_source = "ee_pose"
+
+    return {
+        "joint_path_length": joint_path_length,
+        "smoothness": smoothness,
+        "ee_path_length": ee_path_length,
+        "ee_path_source": ee_path_source,
+        "step_num": int(left_pos.shape[0] + right_pos.shape[0]),
+    }
+
+
+def _load_traj_data(save_path, idx):
+    file_path = os.path.join(save_path, "_traj_data", f"episode{idx}.pkl")
+    with open(file_path, "rb") as f:
+        return pickle.load(f)
+
+
+def _select_high_quality_episodes(args, candidate_count):
+    filter_cfg = args.get("episode_filter", {})
+    target_num = args["episode_num"]
+    weights = filter_cfg.get("weights", {})
+    w_smooth = float(weights.get("smoothness", 1.0))
+    w_joint_len = float(weights.get("joint_path_length", 0.3))
+    w_ee_len = float(weights.get("ee_path_length", 0.7))
+
+    metrics_list = []
+    for idx in range(candidate_count):
+        traj_data = _load_traj_data(args["save_path"], idx)
+        metrics = _compute_episode_metrics(traj_data)
+        cost = (w_smooth * metrics["smoothness"] + w_joint_len * metrics["joint_path_length"] + w_ee_len * metrics["ee_path_length"])
+        metrics["quality_score"] = float(-cost)  # 分数越高越好
+        metrics["source_episode_idx"] = idx
+        metrics_list.append(metrics)
+
+    metrics_list.sort(key=lambda x: x["quality_score"], reverse=True)
+    selected = metrics_list[:target_num]
+    selected_indices = [m["source_episode_idx"] for m in selected]
+
+    filter_log = {
+        "target_episode_num": target_num,
+        "candidate_episode_num": candidate_count,
+        "weights": {
+            "smoothness": w_smooth,
+            "joint_path_length": w_joint_len,
+            "ee_path_length": w_ee_len,
+        },
+        "selected_indices": selected_indices,
+        "selected_metrics": selected,
+        "all_metrics": metrics_list,
+    }
+    return selected_indices, filter_log
 
 
 def main(task_name=None, task_config=None):
@@ -105,6 +234,15 @@ def main(task_name=None, task_config=None):
 
 def run(TASK_ENV, args):
     epid, suc_num, fail_num, seed_list = 0, 0, 0, []
+    selected_indices = []
+    filter_cfg = args.get("episode_filter", {})
+    enable_filter = bool(filter_cfg.get("enable", False))
+    target_episode_num = int(args["episode_num"])
+    oversample_ratio = float(filter_cfg.get("oversample_ratio", 1.3))
+    min_extra = int(filter_cfg.get("min_extra", 5))
+    candidate_episode_num = target_episode_num
+    if enable_filter:
+        candidate_episode_num = max(target_episode_num + min_extra, int(math.ceil(target_episode_num * oversample_ratio)))
 
     print(f"Task Name: \033[34m{args['task_name']}\033[0m")
 
@@ -115,8 +253,10 @@ def run(TASK_ENV, args):
         print("\033[93m" + "[Start Seed and Pre Motion Data Collection]" + "\033[0m")
         args["need_plan"] = True
 
-        if os.path.exists(os.path.join(args["save_path"], "seed.txt")):
-            with open(os.path.join(args["save_path"], "seed.txt"), "r") as file:
+        seed_cache_file = "seed_candidates.txt" if enable_filter else "seed.txt"
+        seed_cache_path = os.path.join(args["save_path"], seed_cache_file)
+        if os.path.exists(seed_cache_path):
+            with open(seed_cache_path, "r") as file:
                 seed_list = file.read().split()
                 if len(seed_list) != 0:
                     seed_list = [int(i) for i in seed_list]
@@ -124,7 +264,7 @@ def run(TASK_ENV, args):
                     epid = max(seed_list) + 1
             print(f"Exist seed file, Start from: {epid} / {suc_num}")
 
-        while suc_num < args["episode_num"]:
+        while suc_num < candidate_episode_num:
             try:
                 TASK_ENV.setup_demo(now_ep_num=suc_num, seed=epid, **args)
                 TASK_ENV.play_once()
@@ -168,16 +308,38 @@ def run(TASK_ENV, args):
 
             epid += 1
 
-            with open(os.path.join(args["save_path"], "seed.txt"), "w") as file:
+            with open(seed_cache_path, "w") as file:
                 for sed in seed_list:
                     file.write("%s " % sed)
 
         print(f"\nComplete simulation, failed \033[91m{fail_num}\033[0m times / {epid} tries \n")
+
+        if enable_filter:
+            selected_indices, filter_log = _select_high_quality_episodes(args, candidate_count=suc_num)
+            selected_seed_list = [seed_list[idx] for idx in selected_indices]
+            with open(os.path.join(args["save_path"], "seed.txt"), "w") as file:
+                for sed in selected_seed_list:
+                    file.write("%s " % sed)
+            with open(os.path.join(args["save_path"], "episode_filter_info.json"), "w", encoding="utf-8") as file:
+                json.dump(filter_log, file, ensure_ascii=False, indent=4)
+            seed_list = selected_seed_list
+            print(f"[Episode Filter] Select {len(selected_indices)}/{suc_num} high-quality episodes.")
+        else:
+            with open(os.path.join(args["save_path"], "seed.txt"), "w") as file:
+                for sed in seed_list:
+                    file.write("%s " % sed)
+            selected_indices = list(range(len(seed_list)))
     else:
         print("\033[93m" + "Use Saved Seeds List".center(30, "-") + "\033[0m")
         with open(os.path.join(args["save_path"], "seed.txt"), "r") as file:
             seed_list = file.read().split()
             seed_list = [int(i) for i in seed_list]
+        if enable_filter and os.path.exists(os.path.join(args["save_path"], "episode_filter_info.json")):
+            with open(os.path.join(args["save_path"], "episode_filter_info.json"), "r", encoding="utf-8") as file:
+                filter_log = json.load(file)
+            selected_indices = [int(i) for i in filter_log.get("selected_indices", list(range(len(seed_list))))]
+        else:
+            selected_indices = list(range(len(seed_list)))
 
     # =========== Collect Data ===========
 
@@ -199,12 +361,14 @@ def run(TASK_ENV, args):
         while exist_hdf5(st_idx):
             st_idx += 1
 
-        for episode_idx in range(st_idx, args["episode_num"]):
+        final_episode_num = min(args["episode_num"], len(selected_indices), len(seed_list))
+        for episode_idx in range(st_idx, final_episode_num):
             print(f"\033[34mTask name: {args['task_name']}\033[0m")
 
+            source_idx = selected_indices[episode_idx]
             TASK_ENV.setup_demo(now_ep_num=episode_idx, seed=seed_list[episode_idx], **args)
 
-            traj_data = TASK_ENV.load_tran_data(episode_idx)
+            traj_data = TASK_ENV.load_tran_data(source_idx)
             args["left_joint_path"] = traj_data["left_joint_path"]
             args["right_joint_path"] = traj_data["right_joint_path"]
             TASK_ENV.set_path_lst(args)
