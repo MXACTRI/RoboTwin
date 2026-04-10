@@ -197,6 +197,20 @@ class Base_Task(gym.Env):
     def check_success(self):
         pass
 
+    def get_success_score(self):
+        """
+        Optional task-specific scoring hook for success-condition quantification.
+        Returns:
+            dict | None:
+              {
+                "score": float,               # Higher is better, recommended [0, 100]
+                "conditions": dict,           # Per-condition quantitative details
+                "description": str (optional) # Human-readable short summary
+              }
+            Return None to disable detailed scoring for this task.
+        """
+        return None
+
     def setup_scene(self, **kwargs):
         """
         Set the scene

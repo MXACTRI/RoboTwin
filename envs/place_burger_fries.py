@@ -129,3 +129,38 @@ class place_burger_fries(Base_Task):
             self.tray.get_functional_point(1, "pose").p[0:2] - self.frenchfries.get_functional_point(0, "pose").p[0:2])
         threshold = 0.08
         return dis1 < threshold and dis2 < threshold and self.is_left_gripper_open() and self.is_right_gripper_open()
+
+    def get_success_score(self):
+        """
+        Quantify each success condition used in check_success and aggregate a score.
+        """
+        dis1 = np.linalg.norm(
+            self.tray.get_functional_point(0, "pose").p[0:2] - self.hamburg.get_functional_point(0, "pose").p[0:2])
+        dis2 = np.linalg.norm(
+            self.tray.get_functional_point(1, "pose").p[0:2] - self.frenchfries.get_functional_point(0, "pose").p[0:2])
+        threshold = 0.08
+        left_open = self.is_left_gripper_open()
+        right_open = self.is_right_gripper_open()
+
+        # Normalize distance conditions to [0, 1], where 1 means perfect alignment.
+        dis1_score = max(0.0, 1.0 - dis1 / threshold)
+        dis2_score = max(0.0, 1.0 - dis2 / threshold)
+        left_score = 1.0 if left_open else 0.0
+        right_score = 1.0 if right_open else 0.0
+
+        score = float((dis1_score + dis2_score + left_score + right_score) / 4.0 * 100.0)
+        return {
+            "score": round(score, 4),
+            "description": "distance-to-tray targets + gripper-open status",
+            "conditions": {
+                "hamburg_to_tray_target_distance": round(float(dis1), 6),
+                "fries_to_tray_target_distance": round(float(dis2), 6),
+                "distance_threshold": threshold,
+                "hamburg_distance_score": round(float(dis1_score), 6),
+                "fries_distance_score": round(float(dis2_score), 6),
+                "left_gripper_open": bool(left_open),
+                "right_gripper_open": bool(right_open),
+                "left_gripper_score": left_score,
+                "right_gripper_score": right_score,
+            },
+        }

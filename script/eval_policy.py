@@ -42,6 +42,27 @@ def eval_function_decorator(policy_name, model_name):
     except ImportError as e:
         raise e
 
+
+def get_success_score_record(task_env, seed, episode_id):
+    score_info = None
+    if hasattr(task_env, "get_success_score"):
+        score_info = task_env.get_success_score()
+
+    if not isinstance(score_info, dict):
+        score_info = {
+            "score": 100.0,
+            "description": "fallback score (check_success passed)",
+            "conditions": {},
+        }
+
+    return {
+        "seed": int(seed),
+        "episode_id": int(episode_id),
+        "score": float(score_info.get("score", 0.0)),
+        "description": score_info.get("description", ""),
+        "conditions": score_info.get("conditions", {}),
+    }
+
 def get_camera_config(camera_type):
     camera_config_path = os.path.join(parent_directory, "../task_config/_camera_config.yml")
 
@@ -163,14 +184,14 @@ def main(usr_args):
     topk = 1
 
     model = get_model(usr_args)
-    st_seed, suc_num = eval_policy(task_name,
-                                   TASK_ENV,
-                                   args,
-                                   model,
-                                   st_seed,
-                                   test_num=test_num,
-                                   video_size=video_size,
-                                   instruction_type=instruction_type)
+    st_seed, suc_num, success_score_records = eval_policy(task_name,
+                                                          TASK_ENV,
+                                                          args,
+                                                          model,
+                                                          st_seed,
+                                                          test_num=test_num,
+                                                          video_size=video_size,
+                                                          instruction_type=instruction_type)
     suc_nums.append(suc_num)
 
     topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
@@ -179,6 +200,16 @@ def main(usr_args):
     with open(file_path, "w") as file:
         file.write(f"Timestamp: {current_time}\n\n")
         file.write(f"Instruction Type: {instruction_type}\n\n")
+        sorted_success_scores = sorted(success_score_records, key=lambda item: item["score"], reverse=True)
+        file.write("Validation Success Scores (sorted, high->low):\n")
+        if sorted_success_scores:
+            for rank, item in enumerate(sorted_success_scores, start=1):
+                file.write(
+                    f"{rank}. seed={item['seed']} episode_id={item['episode_id']} score={item['score']:.4f} "
+                    f"description={item['description']} conditions={item['conditions']}\n")
+        else:
+            file.write("None\n")
+        file.write("\n")
         # file.write(str(task_reward) + '\n')
         file.write("\n".join(map(str, np.array(suc_nums) / test_num)))
 
@@ -204,6 +235,7 @@ def eval_policy(task_name,
     now_id = 0
     succ_seed = 0
     suc_test_seed_list = []
+    success_score_records = []
 
     policy_name = args["policy_name"]
     eval_func = eval_function_decorator(policy_name, "eval")
@@ -246,6 +278,7 @@ def eval_policy(task_name,
         if (not expert_check) or (TASK_ENV.plan_success and TASK_ENV.check_success()):
             succ_seed += 1
             suc_test_seed_list.append(now_seed)
+            success_score_records.append(get_success_score_record(TASK_ENV, now_seed, now_id))
         else:
             now_seed += 1
             args["render_freq"] = render_freq
@@ -321,7 +354,7 @@ def eval_policy(task_name,
         # TASK_ENV._take_picture()
         now_seed += 1
 
-    return now_seed, TASK_ENV.suc
+    return now_seed, TASK_ENV.suc, success_score_records
 
 
 def parse_args_and_config():
