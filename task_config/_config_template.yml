@@ -1,5 +1,12 @@
 render_freq: 0
 episode_num: 50
+episode_filter:
+  enable: false
+  oversample_ratio: 1.3
+  min_extra: 5
+  weights:
+    smoothness: 1.0
+    joint_path_length: 0.3
 use_seed: false
 save_freq: 15
 embodiment:
